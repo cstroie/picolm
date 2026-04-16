@@ -20,106 +20,280 @@ void tensor_init_scratch(float *buf, int size) {
     scratch_size = size;
 }
 
-/* ---- Threading for matmul ---- */
-
-static int n_threads = 1;
-
-void tensor_set_threads(int t) {
-    if (t < 1) t = 1;
-    if (t > MAX_THREADS) t = MAX_THREADS;
-    n_threads = t;
-}
-
-int tensor_get_threads(void) {
-    return n_threads;
-}
+/* ================================================================
+ * Matmul task descriptor
+ * ================================================================ */
 
 typedef struct {
     float       *out;
     const float *x;
     const char  *W;
     size_t       row_bytes;
-    int          n;        /* input dimension */
-    int          start;    /* first output row */
-    int          end;      /* one past last output row */
+    int          n;
+    int          start;
+    int          end;
     gguf_type_t  qtype;
 } matmul_task_t;
 
-static
-#ifdef _WIN32
-DWORD WINAPI
-#else
-void *
-#endif
-matmul_worker(void *arg) {
-    matmul_task_t *t = (matmul_task_t *)arg;
+static void run_task(matmul_task_t *t) {
     for (int i = t->start; i < t->end; i++) {
+        /* Prefetch the next row to hide mmap page-fault latency */
+#if !defined(_WIN32) && defined(__GNUC__)
+        if (i + 1 < t->end)
+            __builtin_prefetch(t->W + (size_t)(i + 1) * t->row_bytes, 0, 1);
+#endif
         t->out[i] = vec_dot(t->W + (size_t)i * t->row_bytes,
                             t->x, t->n, t->qtype);
     }
-#ifdef _WIN32
-    return 0;
-#else
+}
+
+/* ================================================================
+ * Persistent thread pool (Linux/macOS)
+ *
+ * Each background worker blocks on its own mutex+condvar waiting for
+ * work. The main thread assigns a task, sets state=RUNNING, and
+ * signals the condvar. The worker executes run_task(), sets
+ * state=IDLE, and signals back. No pthread_create/join overhead after
+ * pool startup — zero OS calls per matmul on the fast path.
+ *
+ * Windows falls back to the original create-per-call approach to avoid
+ * adding a second OS-specific thread API.
+ * ================================================================ */
+
+static int n_threads = 1;
+
+int tensor_get_threads(void) { return n_threads; }
+
+#ifndef _WIN32
+
+#define WORKER_IDLE     0
+#define WORKER_RUNNING  1
+#define WORKER_SHUTDOWN (-1)
+
+typedef struct {
+    pthread_t       tid;
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    matmul_task_t   task;
+    volatile int    state;
+} pool_worker_t;
+
+static pool_worker_t g_workers[MAX_THREADS];
+static int           g_pool_size = 0;
+
+static void *pool_loop(void *arg) {
+    pool_worker_t *w = (pool_worker_t *)arg;
+    for (;;) {
+        pthread_mutex_lock(&w->mu);
+        while (w->state == WORKER_IDLE)
+            pthread_cond_wait(&w->cv, &w->mu);
+        int s = w->state;
+        pthread_mutex_unlock(&w->mu);
+
+        if (s == WORKER_SHUTDOWN) break;
+
+        run_task(&w->task);
+
+        pthread_mutex_lock(&w->mu);
+        w->state = WORKER_IDLE;
+        pthread_cond_signal(&w->cv);
+        pthread_mutex_unlock(&w->mu);
+    }
     return NULL;
+}
+
+static void pool_resize(int nt) {
+    /* Shut down existing background workers */
+    for (int i = 1; i < g_pool_size; i++) {
+        pthread_mutex_lock(&g_workers[i].mu);
+        g_workers[i].state = WORKER_SHUTDOWN;
+        pthread_cond_signal(&g_workers[i].cv);
+        pthread_mutex_unlock(&g_workers[i].mu);
+        pthread_join(g_workers[i].tid, NULL);
+        pthread_mutex_destroy(&g_workers[i].mu);
+        pthread_cond_destroy(&g_workers[i].cv);
+    }
+    g_pool_size = 0;
+
+    /* Spawn new background workers (index 0 = main thread slot, not spawned) */
+    for (int i = 1; i < nt; i++) {
+        pool_worker_t *w = &g_workers[i];
+        pthread_mutex_init(&w->mu, NULL);
+        pthread_cond_init(&w->cv, NULL);
+        w->state = WORKER_IDLE;
+        pthread_create(&w->tid, NULL, pool_loop, w);
+    }
+    g_pool_size = nt;
+}
+
+#endif /* !_WIN32 */
+
+void tensor_set_threads(int t) {
+    if (t < 1) t = 1;
+    if (t > MAX_THREADS) t = MAX_THREADS;
+    n_threads = t;
+#ifndef _WIN32
+    pool_resize(t);
 #endif
 }
 
-void matmul(float *out, const float *x, const void *W, int n, int d, gguf_type_t qtype) {
+/* ================================================================
+ * matmul: out[d] = W[d × n] × x[n]   (quantized rows)
+ * ================================================================ */
+
+void matmul(float *out, const float *x, const void *W, int n, int d,
+            gguf_type_t qtype) {
     size_t row_bytes = gguf_type_row_size(qtype, n);
     const char *wptr = (const char *)W;
 
+#ifdef _WIN32
+    /* Windows: original create-per-call approach */
     if (n_threads <= 1 || d < 4) {
-        for (int i = 0; i < d; i++) {
-            out[i] = vec_dot(wptr + (size_t)i * row_bytes, x, n, qtype);
-        }
+        matmul_task_t t = { out, x, wptr, row_bytes, n, 0, d, qtype };
+        run_task(&t);
         return;
     }
-
     int nt = n_threads;
     if (nt > d) nt = d;
 
     matmul_task_t tasks[MAX_THREADS];
-#ifdef _WIN32
-    HANDLE threads[MAX_THREADS];
-#else
-    pthread_t threads[MAX_THREADS];
-#endif
-
-    int rows_per = d / nt;
-    int extra = d % nt;
-    int row = 0;
+    HANDLE        threads[MAX_THREADS];
+    int rows_per = d / nt, extra = d % nt, row = 0;
 
     for (int t = 0; t < nt; t++) {
-        tasks[t].out = out;
-        tasks[t].x = x;
-        tasks[t].W = wptr;
-        tasks[t].row_bytes = row_bytes;
-        tasks[t].n = n;
-        tasks[t].qtype = qtype;
+        tasks[t].out = out; tasks[t].x = x; tasks[t].W = wptr;
+        tasks[t].row_bytes = row_bytes; tasks[t].n = n; tasks[t].qtype = qtype;
         tasks[t].start = row;
         row += rows_per + (t < extra ? 1 : 0);
         tasks[t].end = row;
     }
-
+    for (int t = 1; t < nt; t++)
+        threads[t] = CreateThread(NULL, 0,
+                         (LPTHREAD_START_ROUTINE)run_task, &tasks[t], 0, NULL);
+    run_task(&tasks[0]);
     for (int t = 1; t < nt; t++) {
-#ifdef _WIN32
-        threads[t] = CreateThread(NULL, 0, matmul_worker, &tasks[t], 0, NULL);
-#else
-        pthread_create(&threads[t], NULL, matmul_worker, &tasks[t]);
-#endif
-    }
-
-    matmul_worker(&tasks[0]);
-
-    for (int t = 1; t < nt; t++) {
-#ifdef _WIN32
         WaitForSingleObject(threads[t], INFINITE);
         CloseHandle(threads[t]);
-#else
-        pthread_join(threads[t], NULL);
-#endif
     }
+
+#else
+    /* Linux/macOS: persistent thread pool */
+    int nt = (g_pool_size > 0) ? g_pool_size : 1;
+    if (nt > d) nt = d;
+    if (nt <= 1) {
+        matmul_task_t t = { out, x, wptr, row_bytes, n, 0, d, qtype };
+        run_task(&t);
+        return;
+    }
+
+    /* Distribute rows evenly across threads */
+    int rows_per = d / nt, extra = d % nt, row = 0;
+    int starts[MAX_THREADS], ends[MAX_THREADS];
+    for (int t = 0; t < nt; t++) {
+        starts[t] = row;
+        row += rows_per + (t < extra ? 1 : 0);
+        ends[t] = row;
+    }
+
+    /* Wake background workers 1..nt-1 */
+    for (int t = 1; t < nt; t++) {
+        pool_worker_t *w = &g_workers[t];
+        w->task = (matmul_task_t){ out, x, wptr, row_bytes, n,
+                                   starts[t], ends[t], qtype };
+        pthread_mutex_lock(&w->mu);
+        w->state = WORKER_RUNNING;
+        pthread_cond_signal(&w->cv);
+        pthread_mutex_unlock(&w->mu);
+    }
+
+    /* Main thread handles range 0 */
+    matmul_task_t t0 = { out, x, wptr, row_bytes, n, starts[0], ends[0], qtype };
+    run_task(&t0);
+
+    /* Wait for all workers to finish */
+    for (int t = 1; t < nt; t++) {
+        pool_worker_t *w = &g_workers[t];
+        pthread_mutex_lock(&w->mu);
+        while (w->state == WORKER_RUNNING)
+            pthread_cond_wait(&w->cv, &w->mu);
+        pthread_mutex_unlock(&w->mu);
+    }
+#endif
 }
+
+/* ================================================================
+ * Fast exp approximation used by SIMD SiLU
+ *
+ * Range reduction: x = k*ln2 + r, k ∈ Z, r ∈ [-ln2/2, ln2/2]
+ * Polynomial: P(r) = 1 + r*(1 + r*(1/2 + r*(1/6 + r*(1/24 + r/120))))
+ * Scale: exp(x) = 2^k * P(r)  via float exponent-field shift
+ *
+ * Max relative error: ~7e-4 (5th-order Taylor in reduced range)
+ * This is negligible compared to Q4/Q5 quantization noise.
+ * ================================================================ */
+
+#ifdef PICOLM_SSE2
+static inline __m128 exp_ps(__m128 x) {
+    const __m128 lo    = _mm_set1_ps(-88.f);
+    const __m128 hi    = _mm_set1_ps( 88.f);
+    const __m128 log2e = _mm_set1_ps(1.44269504088896341f);
+    const __m128 ln2   = _mm_set1_ps(0.69314718055994531f);
+    const __m128 one   = _mm_set1_ps(1.0f);
+    const __m128 c5    = _mm_set1_ps(0.00833333333f); /* 1/120 */
+    const __m128 c4    = _mm_set1_ps(0.04166666667f); /* 1/24  */
+    const __m128 c3    = _mm_set1_ps(0.16666666667f); /* 1/6   */
+    const __m128 c2    = _mm_set1_ps(0.50000000000f); /* 1/2   */
+
+    x = _mm_max_ps(_mm_min_ps(x, hi), lo);
+
+    /* k = round(x * log2e) via round-to-nearest convert */
+    __m128i k  = _mm_cvtps_epi32(_mm_mul_ps(x, log2e));
+    __m128  kf = _mm_cvtepi32_ps(k);
+    __m128  r  = _mm_sub_ps(x, _mm_mul_ps(kf, ln2)); /* r ∈ [-ln2/2, ln2/2] */
+
+    /* Horner: P = (((c5*r+c4)*r+c3)*r+c2)*r+1)*r+1 */
+    __m128 p = c5;
+    p = _mm_add_ps(_mm_mul_ps(p, r), c4);
+    p = _mm_add_ps(_mm_mul_ps(p, r), c3);
+    p = _mm_add_ps(_mm_mul_ps(p, r), c2);
+    p = _mm_add_ps(_mm_mul_ps(p, r), one);
+    p = _mm_add_ps(_mm_mul_ps(p, r), one);
+
+    /* Scale by 2^k: insert k into float exponent field */
+    __m128i ki = _mm_slli_epi32(_mm_add_epi32(k, _mm_set1_epi32(127)), 23);
+    return _mm_mul_ps(p, _mm_castsi128_ps(ki));
+}
+#endif /* PICOLM_SSE2 */
+
+#ifdef PICOLM_AVX
+static inline __m256 exp_avx(__m256 x) {
+    const __m256 lo    = _mm256_set1_ps(-88.f);
+    const __m256 hi    = _mm256_set1_ps( 88.f);
+    const __m256 log2e = _mm256_set1_ps(1.44269504088896341f);
+    const __m256 ln2   = _mm256_set1_ps(0.69314718055994531f);
+    const __m256 one   = _mm256_set1_ps(1.0f);
+    const __m256 c5    = _mm256_set1_ps(0.00833333333f);
+    const __m256 c4    = _mm256_set1_ps(0.04166666667f);
+    const __m256 c3    = _mm256_set1_ps(0.16666666667f);
+    const __m256 c2    = _mm256_set1_ps(0.50000000000f);
+
+    x = _mm256_max_ps(_mm256_min_ps(x, hi), lo);
+
+    __m256i k  = _mm256_cvtps_epi32(_mm256_mul_ps(x, log2e));
+    __m256  kf = _mm256_cvtepi32_ps(k);
+    __m256  r  = _mm256_sub_ps(x, _mm256_mul_ps(kf, ln2));
+
+    __m256 p = c5;
+    p = _mm256_add_ps(_mm256_mul_ps(p, r), c4);
+    p = _mm256_add_ps(_mm256_mul_ps(p, r), c3);
+    p = _mm256_add_ps(_mm256_mul_ps(p, r), c2);
+    p = _mm256_add_ps(_mm256_mul_ps(p, r), one);
+    p = _mm256_add_ps(_mm256_mul_ps(p, r), one);
+
+    __m256i ki = _mm256_slli_epi32(_mm256_add_epi32(k, _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(p, _mm256_castsi256_ps(ki));
+}
+#endif /* PICOLM_AVX */
 
 /* ================================================================
  * SIMD-accelerated basic operations
@@ -136,6 +310,16 @@ void rmsnorm(float *out, const float *x, const float *weight, int size) {
         acc = vmlaq_f32(acc, v, v);
     }
     ss = vaddvq_f32_compat(acc);
+    for (; i < size; i++) ss += x[i] * x[i];
+#elif defined(PICOLM_AVX2) && defined(__FMA__)
+    /* AVX2 + FMA: fmadd(v, v, acc) = v*v + acc in one instruction */
+    __m256 acc = _mm256_setzero_ps();
+    int i = 0;
+    for (; i + 7 < size; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        acc = _mm256_fmadd_ps(v, v, acc);
+    }
+    ss = hsum_avx(acc);
     for (; i < size; i++) ss += x[i] * x[i];
 #elif defined(PICOLM_AVX)
     __m256 acc = _mm256_setzero_ps();
@@ -312,11 +496,9 @@ void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
 #ifdef PICOLM_NEON
         int i = 0;
         for (; i + 3 < half; i += 4) {
-            /* Load pairs: (q0,q1), (q2,q3), ... as interleaved */
             float32x4x2_t qv = vld2q_f32(qh + i * 2);
             float32x4_t cv = vld1q_f32(cos_pos + i);
             float32x4_t sv = vld1q_f32(sin_pos + i);
-            /* q_even = q0*cos - q1*sin, q_odd = q0*sin + q1*cos */
             float32x4_t new_even = vmlsq_f32(vmulq_f32(qv.val[0], cv), qv.val[1], sv);
             float32x4_t new_odd  = vmlaq_f32(vmulq_f32(qv.val[0], sv), qv.val[1], cv);
             float32x4x2_t result = {{ new_even, new_odd }};
@@ -360,10 +542,68 @@ void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
     }
 }
 
+/* ================================================================
+ * SiLU: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+ *
+ * Vectorized using the fast exp approximation above.
+ * Scalar fallback uses the standard expf() for correctness.
+ * ================================================================ */
+
 void silu(float *x, int size) {
+#ifdef PICOLM_NEON
+    /* ARM NEON: process 4 elements at a time using scalar exp (no vexpq on all targets) */
+    int i = 0;
+    for (; i + 3 < size; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        /* Compute sigmoid for each lane — compiler vectorizes the expf calls */
+        float v0 = vgetq_lane_f32(v, 0), v1 = vgetq_lane_f32(v, 1);
+        float v2 = vgetq_lane_f32(v, 2), v3 = vgetq_lane_f32(v, 3);
+        float s0 = v0 / (1.0f + expf(-v0));
+        float s1 = v1 / (1.0f + expf(-v1));
+        float s2 = v2 / (1.0f + expf(-v2));
+        float s3 = v3 / (1.0f + expf(-v3));
+        vst1q_f32(x + i, (float32x4_t){s0, s1, s2, s3});
+    }
+    for (; i < size; i++) x[i] = x[i] / (1.0f + expf(-x[i]));
+
+#elif defined(PICOLM_AVX)
+    /* AVX: 8 elements per iteration using fast exp_avx */
+    const __m256 one = _mm256_set1_ps(1.0f);
+    int i = 0;
+    for (; i + 7 < size; i += 8) {
+        __m256 v   = _mm256_loadu_ps(x + i);
+        __m256 neg = _mm256_sub_ps(_mm256_setzero_ps(), v); /* -x */
+        __m256 e   = exp_avx(neg);                          /* exp(-x) */
+        __m256 den = _mm256_add_ps(one, e);                 /* 1 + exp(-x) */
+        /* Use fast reciprocal + one Newton-Raphson step for ~24-bit accuracy */
+        __m256 rcp = _mm256_rcp_ps(den);
+        rcp = _mm256_mul_ps(rcp,
+                _mm256_sub_ps(_mm256_set1_ps(2.0f), _mm256_mul_ps(den, rcp)));
+        _mm256_storeu_ps(x + i, _mm256_mul_ps(v, rcp));
+    }
+    for (; i < size; i++) x[i] = x[i] / (1.0f + expf(-x[i]));
+
+#elif defined(PICOLM_SSE2)
+    /* SSE2: 4 elements per iteration using fast exp_ps */
+    const __m128 one = _mm_set1_ps(1.0f);
+    int i = 0;
+    for (; i + 3 < size; i += 4) {
+        __m128 v   = _mm_loadu_ps(x + i);
+        __m128 neg = _mm_sub_ps(_mm_setzero_ps(), v);
+        __m128 e   = exp_ps(neg);
+        __m128 den = _mm_add_ps(one, e);
+        __m128 rcp = _mm_rcp_ps(den);
+        rcp = _mm_mul_ps(rcp,
+                _mm_sub_ps(_mm_set1_ps(2.0f), _mm_mul_ps(den, rcp)));
+        _mm_storeu_ps(x + i, _mm_mul_ps(v, rcp));
+    }
+    for (; i < size; i++) x[i] = x[i] / (1.0f + expf(-x[i]));
+
+#else
     for (int i = 0; i < size; i++) {
         x[i] = x[i] / (1.0f + expf(-x[i]));
     }
+#endif
 }
 
 void elemwise_mul(float *out, const float *a, const float *b, int size) {

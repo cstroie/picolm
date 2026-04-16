@@ -141,6 +141,17 @@ typedef struct {
 } block_q6_K;            /* 210 bytes */
 #pragma pack(pop)
 
+/* Q5_K block: 256 weights in 176 bytes */
+#pragma pack(push, 1)
+typedef struct {
+    uint16_t d;          /* super-block scale (FP16) */
+    uint16_t dmin;       /* super-block min   (FP16) */
+    uint8_t  scales[12]; /* packed 6-bit scales and mins (same as Q4_K) */
+    uint8_t  qh[32];     /* 1 high bit per weight (256 bits total) */
+    uint8_t  qs[128];    /* 4-bit low quants (256 nibbles, same layout as Q4_K) */
+} block_q5_K;            /* 176 bytes */
+#pragma pack(pop)
+
 /* Q4_0 block: 32 weights */
 #pragma pack(push, 1)
 typedef struct {
@@ -179,6 +190,8 @@ size_t gguf_type_row_size(gguf_type_t type, int n);
 float vec_dot_q4_K_f32(const void *src, const float *x, int n);
 float vec_dot_q6_K_f32(const void *src, const float *x, int n);
 float vec_dot_f32_f32(const void *src, const float *x, int n);
+
+float vec_dot_q5_K_f32(const void *src, const float *x, int n);
 
 /* Generic fused dot product dispatch. Returns dot(dequant(src), x) for n elements. */
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type);

@@ -357,8 +357,13 @@ float vec_dot_f32_f32(const void *src, const float *x, int n) {
     __m256 acc1 = _mm256_setzero_ps();
     int i = 0;
     for (; i + 15 < n; i += 16) {
+#ifdef __FMA__
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i),     _mm256_loadu_ps(x + i),     acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(w + i + 8), _mm256_loadu_ps(x + i + 8), acc1);
+#else
         acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(w + i),     _mm256_loadu_ps(x + i)));
         acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_loadu_ps(w + i + 8), _mm256_loadu_ps(x + i + 8)));
+#endif
     }
     float sum = hsum_avx(_mm256_add_ps(acc0, acc1));
     for (; i < n; i++) sum += w[i] * x[i];
@@ -455,7 +460,8 @@ float vec_dot_q4_K_f32(const void *src, const float *x, int n) {
 #elif defined(PICOLM_AVX2)
             /* AVX2: 256-bit integer ops allow zero-extending 8 uint8 nibbles
              * to 8 int32 in one _mm256_cvtepu8_epi32 instruction, then a
-             * single _mm256_cvtepi32_ps — no multi-step unpack chain needed. */
+             * single _mm256_cvtepi32_ps — no multi-step unpack chain needed.
+             * FMA (if available): fmadd replaces separate mul+add. */
             __m256 sum_qx1_v = _mm256_setzero_ps();
             __m256 sum_x1_v  = _mm256_setzero_ps();
             __m256 sum_qx2_v = _mm256_setzero_ps();
@@ -474,9 +480,14 @@ float vec_dot_q4_K_f32(const void *src, const float *x, int n) {
                 __m256 xv_lo = _mm256_loadu_ps(xp + l);
                 __m256 xv_hi = _mm256_loadu_ps(xp + l + 32);
 
+#ifdef __FMA__
+                sum_qx1_v = _mm256_fmadd_ps(qf_lo, xv_lo, sum_qx1_v);
+                sum_qx2_v = _mm256_fmadd_ps(qf_hi, xv_hi, sum_qx2_v);
+#else
                 sum_qx1_v = _mm256_add_ps(sum_qx1_v, _mm256_mul_ps(qf_lo, xv_lo));
-                sum_x1_v  = _mm256_add_ps(sum_x1_v,  xv_lo);
                 sum_qx2_v = _mm256_add_ps(sum_qx2_v, _mm256_mul_ps(qf_hi, xv_hi));
+#endif
+                sum_x1_v  = _mm256_add_ps(sum_x1_v,  xv_lo);
                 sum_x2_v  = _mm256_add_ps(sum_x2_v,  xv_hi);
             }
             float sum_qx1 = hsum_avx(sum_qx1_v);
@@ -656,10 +667,17 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
                     __m256 qf3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q3_i8));
                     __m256 qf4 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q4_i8));
 
+#ifdef __FMA__
+                    acc1 = _mm256_fmadd_ps(qf1, _mm256_loadu_ps(xp_c + l),      acc1);
+                    acc2 = _mm256_fmadd_ps(qf2, _mm256_loadu_ps(xp_c + l + 32), acc2);
+                    acc3 = _mm256_fmadd_ps(qf3, _mm256_loadu_ps(xp_c + l + 64), acc3);
+                    acc4 = _mm256_fmadd_ps(qf4, _mm256_loadu_ps(xp_c + l + 96), acc4);
+#else
                     acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(qf1, _mm256_loadu_ps(xp_c + l)));
                     acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(qf2, _mm256_loadu_ps(xp_c + l + 32)));
                     acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(qf3, _mm256_loadu_ps(xp_c + l + 64)));
                     acc4 = _mm256_add_ps(acc4, _mm256_mul_ps(qf4, _mm256_loadu_ps(xp_c + l + 96)));
+#endif
                 }
                 sums[sidx + 0] += hsum_avx(acc1);
                 sums[sidx + 2] += hsum_avx(acc2);
@@ -836,11 +854,122 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
     return sumf;
 }
 
+/* ---- vec_dot_q5_K_f32 ----
+ *
+ * Q5_K extends Q4_K with one additional high bit per weight stored in qh[32].
+ * Layout per 256-weight block:
+ *   d, dmin (FP16) — same super-block scales as Q4_K
+ *   scales[12]     — same 6-bit scale/min packing as Q4_K
+ *   qh[32]         — 1 high bit per weight (bit i = (qh[i/8] >> (i%8)) & 1)
+ *   qs[128]        — 4-bit low quants, same nibble layout as Q4_K
+ *
+ * Each 5-bit weight value = (low 4 bits from qs) | (high bit from qh) << 4
+ * Range: 0..31.  Scale/min structure identical to Q4_K.
+ */
+float vec_dot_q5_K_f32(const void *src, const float *x, int n) {
+    const block_q5_K *blocks = (const block_q5_K *)src;
+    int nb = n / 256;
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const block_q5_K *b  = &blocks[i];
+        float d    = fp16_to_fp32(b->d);
+        float dmin = fp16_to_fp32(b->dmin);
+        const uint8_t *q  = b->qs;
+        const uint8_t *qh = b->qh;
+        const float   *xp = x + i * 256;
+
+        int is = 0;
+        for (int j = 0; j < 4; j++) {
+            uint8_t sc, mn;
+            get_scale_min_k4(is,     b->scales, &sc, &mn);
+            float d1 = d * (float)sc, m1 = dmin * (float)mn;
+            get_scale_min_k4(is + 1, b->scales, &sc, &mn);
+            float d2 = d * (float)sc, m2 = dmin * (float)mn;
+
+#ifdef PICOLM_AVX2
+            /* AVX2: process 8 weights per inner iteration.
+             * Each group of 8 consecutive weights shares one qh byte.
+             * _mm256_srlv_epi32 broadcasts the byte and extracts each bit
+             * via a per-element right-shift, giving the 8 high bits in one
+             * instruction — no scalar loop needed. */
+            __m256 sum_qx1_v = _mm256_setzero_ps();
+            __m256 sum_x1_v  = _mm256_setzero_ps();
+            __m256 sum_qx2_v = _mm256_setzero_ps();
+            __m256 sum_x2_v  = _mm256_setzero_ps();
+            const __m128i mask4   = _mm_set1_epi8(0x0F);
+            const __m256i shifts8 = _mm256_set_epi32(7,6,5,4,3,2,1,0);
+            const __m256i one_i   = _mm256_set1_epi32(1);
+
+            for (int l = 0; l < 32; l += 8) {
+                /* 8 consecutive weights share one qh byte */
+                int wi_lo = j * 64 + l;       /* weight index of lo-nibble group */
+                int wi_hi = j * 64 + 32 + l;  /* weight index of hi-nibble group */
+                __m256i hb_lo = _mm256_and_si256(
+                    _mm256_srlv_epi32(_mm256_set1_epi32(qh[wi_lo / 8]), shifts8), one_i);
+                __m256i hb_hi = _mm256_and_si256(
+                    _mm256_srlv_epi32(_mm256_set1_epi32(qh[wi_hi / 8]), shifts8), one_i);
+
+                /* Extract lo/hi nibbles and combine with high bit */
+                __m128i qb  = _mm_loadl_epi64((const __m128i *)(q + l));
+                __m128i lo8 = _mm_and_si128(qb, mask4);
+                __m128i hi8 = _mm_and_si128(_mm_srli_epi16(qb, 4), mask4);
+
+                __m256i lo_i32 = _mm256_add_epi32(_mm256_cvtepu8_epi32(lo8),
+                                     _mm256_slli_epi32(hb_lo, 4)); /* lo | hbit<<4 */
+                __m256i hi_i32 = _mm256_add_epi32(_mm256_cvtepu8_epi32(hi8),
+                                     _mm256_slli_epi32(hb_hi, 4));
+
+                __m256 qf_lo = _mm256_cvtepi32_ps(lo_i32);
+                __m256 qf_hi = _mm256_cvtepi32_ps(hi_i32);
+                __m256 xv_lo = _mm256_loadu_ps(xp + l);
+                __m256 xv_hi = _mm256_loadu_ps(xp + l + 32);
+
+#ifdef __FMA__
+                sum_qx1_v = _mm256_fmadd_ps(qf_lo, xv_lo, sum_qx1_v);
+                sum_qx2_v = _mm256_fmadd_ps(qf_hi, xv_hi, sum_qx2_v);
+#else
+                sum_qx1_v = _mm256_add_ps(sum_qx1_v, _mm256_mul_ps(qf_lo, xv_lo));
+                sum_qx2_v = _mm256_add_ps(sum_qx2_v, _mm256_mul_ps(qf_hi, xv_hi));
+#endif
+                sum_x1_v  = _mm256_add_ps(sum_x1_v,  xv_lo);
+                sum_x2_v  = _mm256_add_ps(sum_x2_v,  xv_hi);
+            }
+            float sum_qx1 = hsum_avx(sum_qx1_v), sum_x1 = hsum_avx(sum_x1_v);
+            float sum_qx2 = hsum_avx(sum_qx2_v), sum_x2 = hsum_avx(sum_x2_v);
+#else
+            /* Scalar fallback */
+            float sum_qx1 = 0.0f, sum_x1 = 0.0f;
+            float sum_qx2 = 0.0f, sum_x2 = 0.0f;
+            for (int l = 0; l < 32; l++) {
+                int wi_lo = j * 64 + l;
+                int wi_hi = j * 64 + 32 + l;
+                int h1 = (qh[wi_lo / 8] >> (wi_lo % 8)) & 1;
+                int h2 = (qh[wi_hi / 8] >> (wi_hi % 8)) & 1;
+                int q1 = (q[l] & 0xF) | (h1 << 4);
+                int q2 = (q[l] >>  4) | (h2 << 4);
+                sum_qx1 += (float)q1 * xp[l];
+                sum_x1  += xp[l];
+                sum_qx2 += (float)q2 * xp[l + 32];
+                sum_x2  += xp[l + 32];
+            }
+#endif
+            sumf += d1 * sum_qx1 - m1 * sum_x1 + d2 * sum_qx2 - m2 * sum_x2;
+
+            xp += 64;
+            q  += 32;
+            is += 2;
+        }
+    }
+    return sumf;
+}
+
 /* ---- Generic dispatch ---- */
 
 float vec_dot(const void *src, const float *x, int n, gguf_type_t type) {
     switch (type) {
         case GGUF_TYPE_Q4_K: return vec_dot_q4_K_f32(src, x, n);
+        case GGUF_TYPE_Q5_K: return vec_dot_q5_K_f32(src, x, n);
         case GGUF_TYPE_Q6_K: return vec_dot_q6_K_f32(src, x, n);
         case GGUF_TYPE_F32:  return vec_dot_f32_f32(src, x, n);
         default: {
