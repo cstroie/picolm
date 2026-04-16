@@ -1,0 +1,7 @@
+Thread pool	Medium	High	All platforms
+FMA in rmsnorm/elemwise	Trivial	Low–Medium	AVX2
+SiLU vectorization	Medium	Medium	All platforms
+Prefetch next weight row	Trivial	Medium	mmap mode
+Q5_K fused dot	Medium	Medium	Q5_K models
+madvise next layer	Easy	Low–Medium	Pi / slow storage
+Softmax fast-exp	Medium	Low	Large vocab
