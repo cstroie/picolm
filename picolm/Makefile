@@ -1,5 +1,5 @@
 CC      = gcc
-CFLAGS  = -O2 -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic
+CFLAGS  = -O3 -std=c11 -D_GNU_SOURCE -Wall -Wextra -Wpedantic
 LDFLAGS = -lm -lpthread
 SRCS    = picolm.c model.c tensor.c quant.c tokenizer.c sampler.c grammar.c
 TARGET  = picolm
@@ -11,11 +11,22 @@ MODEL_DIR ?= /opt/picolm/models
 native: CFLAGS += -march=native
 native: $(TARGET)
 
+# --- x86-64 default (SSE2 only, safe for all x86-64) ---
+x86: sse2
+
+# --- x86-64 with SSE2 only ---
+sse2: CFLAGS += -msse2
+sse2: $(TARGET)
+
+# --- x86-64 with SSE2+SSE3+SSSE3 (covers AMD Phenom/Athlon and similar without AVX) ---
+sse3: CFLAGS += -msse2 -msse3 -mssse3 -mpopcnt
+sse3: $(TARGET)
+
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # --- Static build for single-binary deployment ---
-static: CFLAGS += -march=native
+static: CFLAGS += -msse2
 static: LDFLAGS += -static
 static: $(TARGET)
 
@@ -70,4 +81,4 @@ model:
 clean:
 	rm -f $(TARGET) $(TARGET).exe *.obj *.o
 
-.PHONY: native static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean
+.PHONY: native x86 sse2 sse3 static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean

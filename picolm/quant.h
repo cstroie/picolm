@@ -30,6 +30,11 @@ static inline float hsum_sse(__m128 v) {
 }
 #endif
 
+#if defined(PICOLM_SSE2) && defined(__SSE3__)
+#define PICOLM_SSE3 1
+#include <pmmintrin.h>
+#endif
+
 /* GGUF tensor data types */
 typedef enum {
     GGUF_TYPE_F32   = 0,

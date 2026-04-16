@@ -37,8 +37,6 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -s <int>       RNG seed (default: 42)\n");
     fprintf(stderr, "  -c <int>       Context length override\n");
     fprintf(stderr, "  -j <int>       Number of threads (default: 2)\n");
-    fprintf(stderr, "\nPerformance options:\n");
-    fprintf(stderr, "  --fast         Fast mode: smaller context, fewer threads\n");
     fprintf(stderr, "\nAdvanced options:\n");
     fprintf(stderr, "  --json         Grammar-constrained JSON output mode\n");
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
@@ -77,11 +75,10 @@ int main(int argc, char **argv) {
     float  top_p = 0.9f;
     uint64_t seed = 42;
     int    context_override = 0;
-    int    num_threads = 2;
+    int    num_threads = 4;
     int    json_mode = 0;
     const char *cache_file = NULL;
     int    use_ram = 0; /* 0 = mmap (default), 1 = load into RAM */
-    int    fast_mode = 0; /* 0 = normal, 1 = fast mode (fewer threads, lower context) */
 
     /* Parse arguments */
     for (int i = 2; i < argc; i++) {
@@ -105,8 +102,6 @@ int main(int argc, char **argv) {
             cache_file = argv[++i];
         } else if (strcmp(argv[i], "--mem") == 0) {
             use_ram = 1;
-        } else if (strcmp(argv[i], "--fast") == 0) {
-            fast_mode = 1;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -141,13 +136,6 @@ int main(int argc, char **argv) {
     /* Load model */
     fprintf(stderr, "Loading model: %s\n", model_path);
     fprintf(stderr, "Loading mode: %s\n", use_ram ? "RAM" : "mmap");
-    fprintf(stderr, "Performance mode: %s\n", fast_mode ? "fast" : "normal");
-    
-    /* Apply fast mode settings */
-    if (fast_mode) {
-        if (context_override == 0) context_override = 256; /* smaller context */
-        if (num_threads > 2) num_threads = 2; /* fewer threads */
-    }
     
     model_t model;
     if (model_load(&model, model_path, context_override, use_ram) != 0) {

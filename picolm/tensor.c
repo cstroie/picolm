@@ -206,6 +206,50 @@ void softmax(float *x, int size) {
 #endif
 }
 
+/* ---- SSE2 RoPE helper: apply rotation to one head ---- */
+#ifdef PICOLM_SSE2
+static void rope_sse(float *h, int half, const float *cos_pos, const float *sin_pos) {
+    int i = 0;
+    /* Process 2 complex pairs at a time: [r0, i0, r1, i1]
+     * r_new = r*cos - i*sin,  i_new = r*sin + i*cos
+     *
+     * With SSE: swap pairs to get [i0, r0, i1, r1], broadcast cos/sin,
+     * then use addsub (SSE3) or sign-mask trick (SSE2).
+     *   a = v  * cv  = [r0*c0, i0*c0, r1*c1, i1*c1]
+     *   b = sv * sv' = [i0*s0, r0*s0, i1*s1, r1*s1]
+     *   result[even] = a - b,  result[odd] = a + b  */
+#ifdef PICOLM_SSE3
+    for (; i + 1 < half; i += 2) {
+        __m128 v  = _mm_loadu_ps(h + i * 2);
+        __m128 c2 = _mm_unpacklo_ps(_mm_load_ss(cos_pos + i), _mm_load_ss(cos_pos + i + 1));
+        __m128 s2 = _mm_unpacklo_ps(_mm_load_ss(sin_pos + i), _mm_load_ss(sin_pos + i + 1));
+        __m128 cv = _mm_shuffle_ps(c2, c2, _MM_SHUFFLE(1,1,0,0));
+        __m128 sv = _mm_shuffle_ps(s2, s2, _MM_SHUFFLE(1,1,0,0));
+        __m128 sw = _mm_shuffle_ps(v,  v,  _MM_SHUFFLE(2,3,0,1));
+        _mm_storeu_ps(h + i * 2, _mm_addsub_ps(_mm_mul_ps(v, cv), _mm_mul_ps(sw, sv)));
+    }
+#else
+    const __m128 sign = _mm_set_ps(1.0f, -1.0f, 1.0f, -1.0f);
+    for (; i + 1 < half; i += 2) {
+        __m128 v  = _mm_loadu_ps(h + i * 2);
+        __m128 c2 = _mm_unpacklo_ps(_mm_load_ss(cos_pos + i), _mm_load_ss(cos_pos + i + 1));
+        __m128 s2 = _mm_unpacklo_ps(_mm_load_ss(sin_pos + i), _mm_load_ss(sin_pos + i + 1));
+        __m128 cv = _mm_shuffle_ps(c2, c2, _MM_SHUFFLE(1,1,0,0));
+        __m128 sv = _mm_shuffle_ps(s2, s2, _MM_SHUFFLE(1,1,0,0));
+        __m128 sw = _mm_shuffle_ps(v,  v,  _MM_SHUFFLE(2,3,0,1));
+        __m128 a  = _mm_mul_ps(v, cv);
+        __m128 b  = _mm_mul_ps(_mm_mul_ps(sign, sw), sv);
+        _mm_storeu_ps(h + i * 2, _mm_add_ps(a, b));
+    }
+#endif
+    for (; i < half; i++) {
+        float r = h[i * 2], im = h[i * 2 + 1];
+        h[i * 2]     = r * cos_pos[i] - im * sin_pos[i];
+        h[i * 2 + 1] = r * sin_pos[i] + im * cos_pos[i];
+    }
+}
+#endif
+
 /* Rotary position encoding using pre-computed cos/sin tables */
 void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
           const float *cos_pos, const float *sin_pos) {
@@ -233,6 +277,8 @@ void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
             qh[i * 2]     = q0 * cos_pos[i] - q1 * sin_pos[i];
             qh[i * 2 + 1] = q0 * sin_pos[i] + q1 * cos_pos[i];
         }
+#elif defined(PICOLM_SSE2)
+        rope_sse(qh, half, cos_pos, sin_pos);
 #else
         for (int i = 0; i < half; i++) {
             float q0 = qh[i * 2];
@@ -246,12 +292,16 @@ void rope(float *q, float *k, int head_dim, int n_heads, int n_kv_heads,
     /* Apply RoPE to all KV heads */
     for (int h = 0; h < n_kv_heads; h++) {
         float *kh = k + h * head_dim;
+#ifdef PICOLM_SSE2
+        rope_sse(kh, half, cos_pos, sin_pos);
+#else
         for (int i = 0; i < half; i++) {
             float k0 = kh[i * 2];
             float k1 = kh[i * 2 + 1];
             kh[i * 2]     = k0 * cos_pos[i] - k1 * sin_pos[i];
             kh[i * 2 + 1] = k0 * sin_pos[i] + k1 * cos_pos[i];
         }
+#endif
     }
 }
 
