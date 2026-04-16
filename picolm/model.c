@@ -187,16 +187,53 @@ static int mmap_file(model_t *m, const char *path) {
     return 0;
 }
 
+static int load_file_into_ram(model_t *m, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "Cannot open file: %s\n", path);
+        return -1;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    m->mmap_addr = malloc(size);
+    if (!m->mmap_addr) {
+        fprintf(stderr, "OOM: cannot allocate %ld bytes\n", size);
+        fclose(f);
+        return -1;
+    }
+
+    if (fread(m->mmap_addr, 1, size, f) != size) {
+        fprintf(stderr, "Failed to read file\n");
+        free(m->mmap_addr);
+        m->mmap_addr = NULL;
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    m->mmap_size = (size_t)size;
+    m->use_ram = 1;
+    return 0;
+}
+
 static void munmap_file(model_t *m) {
     if (!m->mmap_addr) return;
+    
+    if (m->use_ram) {
+        free(m->mmap_addr);
+    } else {
 #ifdef _WIN32
-    UnmapViewOfFile(m->mmap_addr);
-    CloseHandle(m->map_handle);
-    CloseHandle(m->file_handle);
+        UnmapViewOfFile(m->mmap_addr);
+        CloseHandle(m->map_handle);
+        CloseHandle(m->file_handle);
 #else
-    munmap(m->mmap_addr, m->mmap_size);
-    close(m->fd);
+        munmap(m->mmap_addr, m->mmap_size);
+        close(m->fd);
 #endif
+    }
     m->mmap_addr = NULL;
 }
 
@@ -406,6 +443,7 @@ static int parse_gguf(model_t *m, int max_seq_len) {
     fprintf(stderr, "  n_layers=%d, vocab_size=%d, max_seq=%d\n",
             cfg->n_layers, cfg->vocab_size, cfg->max_seq_len);
     fprintf(stderr, "  head_dim=%d, rope_base=%.1f\n", cfg->head_dim, cfg->rope_freq_base);
+    fprintf(stderr, "  Loading mode: %s\n", m->use_ram ? "RAM" : "mmap");
 
     free(tinfos);
     return 0;
@@ -535,10 +573,16 @@ static int allocate_run_state(model_t *m) {
 
 /* ---- Public API ---- */
 
-int model_load(model_t *m, const char *path, int max_seq_len) {
+int model_load(model_t *m, const char *path, int max_seq_len, int use_ram) {
     memset(m, 0, sizeof(*m));
+    m->use_ram = use_ram;
 
-    if (mmap_file(m, path) != 0) return -1;
+    if (use_ram) {
+        if (load_file_into_ram(m, path) != 0) return -1;
+    } else {
+        if (mmap_file(m, path) != 0) return -1;
+    }
+    
     if (parse_gguf(m, max_seq_len) != 0) return -1;
     if (allocate_run_state(m) != 0) return -1;
 
