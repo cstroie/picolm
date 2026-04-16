@@ -183,7 +183,7 @@ The model file (638MB) stays on disk. PicoLM **memory-maps** it and streams one 
 | **FP16 KV Cache** | Halves KV cache memory (44MB vs 88MB for 2048 context) |
 | **Flash Attention** | Online softmax — no O(seq_len) attention buffer needed |
 | **Pre-computed RoPE** | cos/sin lookup tables eliminate transcendentals from hot loop |
-| **SIMD Acceleration** | ARM NEON (Pi 3/4/5), x86 SSE2/SSE3, and AVX — auto-detected at compile time |
+| **SIMD Acceleration** | ARM NEON (Pi 3/4/5), x86 SSE2/SSE3/AVX/AVX2 — auto-detected at compile time |
 | **Fused Dot Products** | Dequantize + dot-product in one pass — no intermediate buffer |
 | **Multi-threaded matmul** | Parallel matrix-vector multiply across CPU cores |
 | **Grammar-Constrained JSON** | `--json` flag forces valid JSON output (for tool calling) |
@@ -234,7 +234,10 @@ make model
 
 ```cmd
 cd picolm
-build.bat
+build.bat           :: SSE2 baseline (any x86-64)
+build.bat avx2      :: AVX2 (Haswell+ / Excavator+, fastest)
+build.bat avx       :: AVX  (Sandy Bridge+ / Bulldozer+)
+build.bat scalar    :: no SIMD (portable fallback)
 picolm.exe model.gguf -p "Hello world" -n 50
 ```
 
@@ -246,6 +249,8 @@ make x86         # x86-64 safe default (SSE2 only — runs on any x86-64)
 make sse2        # x86-64 SSE2 only (same as x86)
 make sse3        # x86-64 SSE2+SSE3+SSSE3 (AMD Phenom/Athlon, older Intel)
 make avx         # x86-64 AVX (Sandy Bridge+, Bulldozer+ — wider SIMD, faster)
+make avx2        # x86-64 AVX2 (Haswell+, Excavator+ — widest SIMD, fastest)
+make scalar      # No SIMD (portable scalar fallback, any architecture)
 make pi          # Raspberry Pi 3/4/5 (64-bit ARM + NEON SIMD)
 make pi-arm32    # Pi Zero / Pi 1 (32-bit ARM)
 make cross-pi    # Cross-compile for Pi from x86 (static binary)
@@ -484,13 +489,14 @@ PicoLM implements 9 optimizations that brought generation speed from **1.6 tok/s
 
 4-wide float vector operations for all hot paths. Example: dequantizing Q4_K nibbles with `vmovl_u8` → `vmovl_u16` → `vcvtq_f32_u32`, and RoPE with interleaved `vld2q_f32` / `vst2q_f32`.
 
-### 2. x86 SIMD (SSE2 / SSE3 / AVX)
+### 2. x86 SIMD (SSE2 / SSE3 / AVX / AVX2)
 
-Three compile-time tiers for Intel/AMD:
+Four compile-time tiers for Intel/AMD:
 
 - **SSE2** (`make sse2` or `make x86`): 4-wide `__m128` operations for dot products, RMSNorm, softmax, RoPE, and element-wise ops. Safe baseline for all x86-64 CPUs.
 - **SSE3** (`make sse3`): adds `_mm_addsub_ps` for a cleaner RoPE rotation kernel (no sign-mask workaround needed).
 - **AVX** (`make avx`): 8-wide `__m256` float accumulators for all ops. Q4_K and Q6_K dot products widen the float accumulation stage while keeping integer nibble extraction at 128-bit (no AVX2 required). RoPE processes 4 complex pairs per iteration with `_mm256_addsub_ps`.
+- **AVX2** (`make avx2`): adds 256-bit integer operations. Q4_0 nibble extraction uses `_mm256_cvtepu8_epi32` (8 nibbles → 8 int32 in 2 ops vs. 4-step unpack chain). Q6_K weight extraction uses `_mm256_cvtepi8_epi32` (8 int8 → 8 int32 in 2 ops vs. 4-instruction macro chain). Targets Haswell+ Intel and Excavator+ AMD.
 
 ### 3. FP16 KV Cache
 
@@ -657,7 +663,8 @@ A: Any LLaMA-architecture GGUF model works. Download from [HuggingFace](https://
 ## Roadmap
 
 - [x] AVX kernels for x86 (`make avx` — 8-wide float ops, ~2x vs SSE2)
-- [ ] AVX2/AVX-512 kernels for x86 (256-bit integer ops for quantized paths)
+- [x] AVX2 kernels for x86 (`make avx2` — 256-bit integer ops for Q4_0 and Q6_K quantized paths)
+- [ ] AVX-512 kernels for x86 (512-bit ops for server CPUs)
 - [ ] Speculative decoding with a draft model
 - [ ] Context sliding window (infinite generation beyond max_seq_len)
 - [ ] Weight pruning for further memory reduction

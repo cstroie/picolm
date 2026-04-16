@@ -14,6 +14,10 @@ native: $(TARGET)
 # --- x86-64 default (SSE2 only, safe for all x86-64) ---
 x86: sse2
 
+# --- No SIMD (scalar fallback, portable to any architecture) ---
+scalar: CFLAGS += -mno-sse2 -mno-avx
+scalar: $(TARGET)
+
 # --- x86-64 with SSE2 only ---
 sse2: CFLAGS += -msse2
 sse2: $(TARGET)
@@ -25,6 +29,10 @@ sse3: $(TARGET)
 # --- x86-64 with AVX (Sandy Bridge and newer Intel; Bulldozer and newer AMD) ---
 avx: CFLAGS += -mavx -mpopcnt
 avx: $(TARGET)
+
+# --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
+avx2: CFLAGS += -mavx2 -mpopcnt
+avx2: $(TARGET)
 
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
@@ -85,4 +93,4 @@ model:
 clean:
 	rm -f $(TARGET) $(TARGET).exe *.obj *.o
 
-.PHONY: native x86 sse2 sse3 avx static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean
+.PHONY: native x86 scalar sse2 sse3 avx avx2 static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean

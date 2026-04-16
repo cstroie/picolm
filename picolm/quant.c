@@ -452,6 +452,37 @@ float vec_dot_q4_K_f32(const void *src, const float *x, int n) {
             float sum_x1  = vaddvq_f32_compat(sum_x1_v);
             float sum_qx2 = vaddvq_f32_compat(sum_qx2_v);
             float sum_x2  = vaddvq_f32_compat(sum_x2_v);
+#elif defined(PICOLM_AVX2)
+            /* AVX2: 256-bit integer ops allow zero-extending 8 uint8 nibbles
+             * to 8 int32 in one _mm256_cvtepu8_epi32 instruction, then a
+             * single _mm256_cvtepi32_ps — no multi-step unpack chain needed. */
+            __m256 sum_qx1_v = _mm256_setzero_ps();
+            __m256 sum_x1_v  = _mm256_setzero_ps();
+            __m256 sum_qx2_v = _mm256_setzero_ps();
+            __m256 sum_x2_v  = _mm256_setzero_ps();
+            const __m128i mask4 = _mm_set1_epi8(0x0F);
+
+            for (int l = 0; l < 32; l += 8) {
+                __m128i qb  = _mm_loadl_epi64((const __m128i *)(q + l));
+                __m128i lo8 = _mm_and_si128(qb, mask4);
+                __m128i hi8 = _mm_and_si128(_mm_srli_epi16(qb, 4), mask4);
+
+                /* AVX2: zero-extend 8 uint8 → 8 int32 → 8 float in 2 ops */
+                __m256 qf_lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo8));
+                __m256 qf_hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi8));
+
+                __m256 xv_lo = _mm256_loadu_ps(xp + l);
+                __m256 xv_hi = _mm256_loadu_ps(xp + l + 32);
+
+                sum_qx1_v = _mm256_add_ps(sum_qx1_v, _mm256_mul_ps(qf_lo, xv_lo));
+                sum_x1_v  = _mm256_add_ps(sum_x1_v,  xv_lo);
+                sum_qx2_v = _mm256_add_ps(sum_qx2_v, _mm256_mul_ps(qf_hi, xv_hi));
+                sum_x2_v  = _mm256_add_ps(sum_x2_v,  xv_hi);
+            }
+            float sum_qx1 = hsum_avx(sum_qx1_v);
+            float sum_x1  = hsum_avx(sum_x1_v);
+            float sum_qx2 = hsum_avx(sum_qx2_v);
+            float sum_x2  = hsum_avx(sum_x2_v);
 #elif defined(PICOLM_AVX)
             /* AVX: nibble extraction stays 128-bit (no AVX2 int), float
              * accumulators widen to 256-bit (8 floats) halving float ops. */
@@ -577,7 +608,66 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
     fb = _mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpackhi_epi16(zero_i, w16), 16)); \
 } while (0)
 
-#ifdef PICOLM_AVX
+#ifdef PICOLM_AVX2
+        /* AVX2: 256-bit integer ops — _mm256_cvtepi8_epi32 sign-extends 8
+         * int8 values to 8 int32 in __m256i in one instruction, replacing
+         * the 4-instruction Q6K_CONV chain used in the AVX path. */
+        const __m128i mask4  = _mm_set1_epi8(0x0F);
+        const __m128i mask3  = _mm_set1_epi8(0x03);
+        const __m128i sub32  = _mm_set1_epi8(32);
+
+        for (int chunk = 0; chunk < 2; chunk++) {
+            int is = chunk * 8;
+            const uint8_t *ql_c = ql + chunk * 64;
+            const uint8_t *qh_c = qh + chunk * 32;
+            const float   *xp_c = xp + chunk * 128;
+
+            for (int half = 0; half < 2; half++) {
+                int l0   = half * 16;
+                int sidx = is + half;
+                __m256 acc1 = _mm256_setzero_ps();
+                __m256 acc2 = _mm256_setzero_ps();
+                __m256 acc3 = _mm256_setzero_ps();
+                __m256 acc4 = _mm256_setzero_ps();
+
+                for (int l = l0; l < l0 + 16; l += 8) {
+                    __m128i qla = _mm_loadl_epi64((const __m128i *)(ql_c + l));
+                    __m128i qlb = _mm_loadl_epi64((const __m128i *)(ql_c + l + 32));
+                    __m128i qhv = _mm_loadl_epi64((const __m128i *)(qh_c + l));
+
+                    __m128i lo_a = _mm_and_si128(qla, mask4);
+                    __m128i hi_a = _mm_and_si128(_mm_srli_epi16(qla, 4), mask4);
+                    __m128i lo_b = _mm_and_si128(qlb, mask4);
+                    __m128i hi_b = _mm_and_si128(_mm_srli_epi16(qlb, 4), mask4);
+
+                    __m128i h01 = _mm_and_si128(qhv, mask3);
+                    __m128i h23 = _mm_and_si128(_mm_srli_epi16(qhv, 2), mask3);
+                    __m128i h45 = _mm_and_si128(_mm_srli_epi16(qhv, 4), mask3);
+                    __m128i h67 = _mm_and_si128(_mm_srli_epi16(qhv, 6), mask3);
+
+                    __m128i q1_i8 = _mm_sub_epi8(_mm_or_si128(lo_a, _mm_slli_epi16(h01, 4)), sub32);
+                    __m128i q2_i8 = _mm_sub_epi8(_mm_or_si128(lo_b, _mm_slli_epi16(h23, 4)), sub32);
+                    __m128i q3_i8 = _mm_sub_epi8(_mm_or_si128(hi_a, _mm_slli_epi16(h45, 4)), sub32);
+                    __m128i q4_i8 = _mm_sub_epi8(_mm_or_si128(hi_b, _mm_slli_epi16(h67, 4)), sub32);
+
+                    /* AVX2: sign-extend 8 int8 → 8 int32 → 8 float in 2 ops */
+                    __m256 qf1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q1_i8));
+                    __m256 qf2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q2_i8));
+                    __m256 qf3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q3_i8));
+                    __m256 qf4 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(q4_i8));
+
+                    acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(qf1, _mm256_loadu_ps(xp_c + l)));
+                    acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(qf2, _mm256_loadu_ps(xp_c + l + 32)));
+                    acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(qf3, _mm256_loadu_ps(xp_c + l + 64)));
+                    acc4 = _mm256_add_ps(acc4, _mm256_mul_ps(qf4, _mm256_loadu_ps(xp_c + l + 96)));
+                }
+                sums[sidx + 0] += hsum_avx(acc1);
+                sums[sidx + 2] += hsum_avx(acc2);
+                sums[sidx + 4] += hsum_avx(acc3);
+                sums[sidx + 6] += hsum_avx(acc4);
+            }
+        }
+#elif defined(PICOLM_AVX)
         /* AVX: same 128-bit integer extraction as SSE2, but float
          * accumulators are 256-bit — halves the number of float instructions. */
         const __m128i mask4  = _mm_set1_epi8(0x0F);
