@@ -27,7 +27,7 @@ sse3: CFLAGS += -msse2 -msse3 -mssse3 -mpopcnt
 sse3: $(TARGET)
 
 # --- x86-64 with AVX (Sandy Bridge and newer Intel; Bulldozer and newer AMD) ---
-avx: CFLAGS += -mavx -mpopcnt
+avx: CFLAGS += -mavx2 -mfma -mpopcnt
 avx: $(TARGET)
 
 # --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
