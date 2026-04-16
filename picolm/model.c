@@ -205,7 +205,7 @@ static int load_file_into_ram(model_t *m, const char *path) {
         return -1;
     }
 
-    if (fread(m->mmap_addr, 1, size, f) != size) {
+    if (fread(m->mmap_addr, 1, (size_t)size, f) != (size_t)size) {
         fprintf(stderr, "Failed to read file\n");
         free(m->mmap_addr);
         m->mmap_addr = NULL;

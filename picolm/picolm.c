@@ -132,7 +132,7 @@ int main(int argc, char **argv) {
     /* Load model */
     fprintf(stderr, "Loading model: %s\n", model_path);
     model_t model;
-    if (model_load(&model, model_path, context_override) != 0) {
+    if (model_load(&model, model_path, context_override, 0) != 0) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
