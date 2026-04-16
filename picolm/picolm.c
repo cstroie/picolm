@@ -36,7 +36,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -k <float>     Top-p / nucleus sampling (default: 0.9)\n");
     fprintf(stderr, "  -s <int>       RNG seed (default: 42)\n");
     fprintf(stderr, "  -c <int>       Context length override\n");
-    fprintf(stderr, "  -j <int>       Number of threads (default: 2)\n");
+    fprintf(stderr, "  -j <int>       Number of threads (default: 4)\n");
     fprintf(stderr, "\nAdvanced options:\n");
     fprintf(stderr, "  --json         Grammar-constrained JSON output mode\n");
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");

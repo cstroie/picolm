@@ -22,6 +22,10 @@ sse2: $(TARGET)
 sse3: CFLAGS += -msse2 -msse3 -mssse3 -mpopcnt
 sse3: $(TARGET)
 
+# --- x86-64 with AVX (Sandy Bridge and newer Intel; Bulldozer and newer AMD) ---
+avx: CFLAGS += -mavx -mpopcnt
+avx: $(TARGET)
+
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -81,4 +85,4 @@ model:
 clean:
 	rm -f $(TARGET) $(TARGET).exe *.obj *.o
 
-.PHONY: native x86 sse2 sse3 static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean
+.PHONY: native x86 sse2 sse3 avx static pi pi-arm32 cross-pi riscv cross-riscv debug install model clean

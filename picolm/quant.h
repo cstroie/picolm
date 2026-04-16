@@ -35,6 +35,16 @@ static inline float hsum_sse(__m128 v) {
 #include <pmmintrin.h>
 #endif
 
+#if defined(PICOLM_SSE2) && defined(__AVX__)
+#define PICOLM_AVX 1
+/* immintrin.h already included above; AVX intrinsics are available */
+static inline float hsum_avx(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    return hsum_sse(_mm_add_ps(lo, hi));
+}
+#endif
+
 /* GGUF tensor data types */
 typedef enum {
     GGUF_TYPE_F32   = 0,
