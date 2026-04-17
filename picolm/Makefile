@@ -33,7 +33,7 @@ avx: $(TARGET)
 # --- x86-64 with AVX2 (Haswell and newer Intel; Excavator and newer AMD) ---
 # -mfma is listed separately: all AVX2 CPUs support FMA3 but GCC requires
 # an explicit flag to emit vfmadd231ps etc.
-avx2: CFLAGS += -mavx2 -mfma -mpopcnt
+avx2: CFLAGS += -mavx2 -mfma -mf16c -mpopcnt
 avx2: $(TARGET)
 
 $(TARGET): $(SRCS)

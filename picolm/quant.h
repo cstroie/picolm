@@ -54,6 +54,11 @@ static inline float vaddvq_f32_compat(float32x4_t v) {
 #  define PICOLM_SSE2 1
 #endif
 
+/* F16C: hardware FP16<->FP32 conversion (Ivy Bridge+, all AVX2 CPUs) */
+#if defined(__F16C__)
+#  define PICOLM_F16C 1
+#endif
+
 /* Include x86 SIMD header once for any x86 SIMD level.
  * <immintrin.h> is an umbrella header that exposes all intrinsics
  * available for the current -march target. */
