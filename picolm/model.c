@@ -589,6 +589,108 @@ int model_load(model_t *m, const char *path, int max_seq_len, int use_ram) {
 }
 
 /* ================================================================
+ * Attention head task — used by tensor_parallel to run a range of
+ * heads concurrently across the thread pool.
+ * ================================================================ */
+
+typedef struct {
+    const float    *q;           /* full Q buffer (read-only)       */
+    const uint16_t *kcache;      /* key cache for this layer        */
+    const uint16_t *vcache;      /* val cache for this layer        */
+    float          *xb;          /* output buffer (disjoint per head) */
+    int             pos;
+    int             head_dim;
+    int             kv_dim;
+    int             kv_mul;
+    int             h_start;
+    int             h_end;
+} attn_head_task_t;
+
+static void run_attn_heads(void *arg) {
+    attn_head_task_t *t = (attn_head_task_t *)arg;
+    const float    *q      = t->q;
+    const uint16_t *kcache = t->kcache;
+    const uint16_t *vcache = t->vcache;
+    float          *xb     = t->xb;
+    int pos      = t->pos;
+    int head_dim = t->head_dim;
+    int kv_dim   = t->kv_dim;
+    int kv_mul   = t->kv_mul;
+
+    const float inv_scale = 1.0f / sqrtf((float)head_dim);
+
+    for (int h = t->h_start; h < t->h_end; h++) {
+        const float *qh  = q  + h * head_dim;
+        int          kv_h = h / kv_mul;
+        float       *xbh = xb + h * head_dim;
+
+        float max_score = -1e30f;
+        float sum_exp   = 0.0f;
+        float acc[256];
+        memset(acc, 0, (size_t)head_dim * sizeof(float));
+
+        for (int tp = 0; tp <= pos; tp++) {
+            const uint16_t *kt = kcache + (size_t)tp * kv_dim + kv_h * head_dim;
+            float score = 0.0f;
+#if defined(PICOLM_F16C) && defined(__FMA__)
+            {
+                __m256 vsum = _mm256_setzero_ps();
+                int d = 0;
+                for (; d + 7 < head_dim; d += 8) {
+                    __m256 vq = _mm256_loadu_ps(qh + d);
+                    __m256 vk = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(kt + d)));
+                    vsum = _mm256_fmadd_ps(vq, vk, vsum);
+                }
+                score = hsum_avx(vsum);
+                for (; d < head_dim; d++) score += qh[d] * fp16_to_fp32(kt[d]);
+            }
+#else
+            for (int d = 0; d < head_dim; d++)
+                score += qh[d] * fp16_to_fp32(kt[d]);
+#endif
+            score *= inv_scale;
+
+            const uint16_t *vt = vcache + (size_t)tp * kv_dim + kv_h * head_dim;
+            float new_max    = fmaxf(score, max_score);
+            float correction = expf(max_score - new_max);
+            float w          = expf(score    - new_max);
+            sum_exp = sum_exp * correction + w;
+#if defined(PICOLM_F16C) && defined(__FMA__)
+            {
+                __m256 vcorr = _mm256_set1_ps(correction);
+                __m256 vw    = _mm256_set1_ps(w);
+                int d = 0;
+                for (; d + 7 < head_dim; d += 8) {
+                    __m256 vacc = _mm256_loadu_ps(acc + d);
+                    __m256 vv   = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(vt + d)));
+                    _mm256_storeu_ps(acc + d, _mm256_fmadd_ps(vcorr, vacc, _mm256_mul_ps(vw, vv)));
+                }
+                for (; d < head_dim; d++) acc[d] = acc[d] * correction + w * fp16_to_fp32(vt[d]);
+            }
+#else
+            for (int d = 0; d < head_dim; d++)
+                acc[d] = acc[d] * correction + w * fp16_to_fp32(vt[d]);
+#endif
+            max_score = new_max;
+        }
+
+        float inv_sum = 1.0f / sum_exp;
+#ifdef PICOLM_AVX
+        {
+            __m256 vinv = _mm256_set1_ps(inv_sum);
+            int d = 0;
+            for (; d + 7 < head_dim; d += 8)
+                _mm256_storeu_ps(xbh + d, _mm256_mul_ps(_mm256_loadu_ps(acc + d), vinv));
+            for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
+        }
+#else
+        for (int d = 0; d < head_dim; d++)
+            xbh[d] = acc[d] * inv_sum;
+#endif
+    }
+}
+
+/* ================================================================
  * Forward pass with:
  *   - FP16 KV cache (halves memory bandwidth in attention)
  *   - Flash attention / online softmax (single pass, no score buffer)
@@ -656,104 +758,28 @@ float *model_forward(model_t *m, int token, int pos) {
             val_pos_fp16[d] = fp32_to_fp16(v_tmp[d]);
         }
 
-        /* ---- Flash Attention (online softmax) ----
+        /* ---- Flash Attention (online softmax, parallel over heads) ----
          *
-         * Instead of materializing the full [n_heads * seq_len] score array,
-         * compute attention in a single pass using the online softmax trick:
-         *
-         *   max_s = -inf, sum_exp = 0, acc[d] = 0
-         *   for each cached position t:
-         *     s = dot(Q_h, K_t) / sqrt(d)
-         *     if s > max_s:
-         *       correction = exp(max_s - s)
-         *       acc *= correction, sum_exp *= correction
-         *       sum_exp += 1, acc += V_t
-         *       max_s = s
-         *     else:
-         *       w = exp(s - max_s)
-         *       sum_exp += w, acc += w * V_t
-         *   result = acc / sum_exp
-         *
-         * This saves memory (no att[] buffer) and is more cache-friendly.
+         * Heads are independent: each writes to a disjoint region of xb.
+         * tensor_parallel distributes them across the thread pool.
+         * The pool is idle here (matmul has returned), so no over-subscription.
          */
-        for (int h = 0; h < n_heads; h++) {
-            float *qh = s->q + h * head_dim;
-            int kv_h = h / kv_mul;
-            float *xbh = s->xb + h * head_dim;
-
-            float max_score = -1e30f;
-            float sum_exp = 0.0f;
-            /* Accumulator for weighted V values */
-            float acc[256]; /* head_dim is typically 64-128 */
-            memset(acc, 0, (size_t)head_dim * sizeof(float));
-
-            const float inv_scale = 1.0f / sqrtf((float)head_dim);
-
-            for (int t = 0; t <= pos; t++) {
-                /* Compute score: dot(Q_h, K_t) * inv_sqrt(head_dim) */
-                const uint16_t *kt = kcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
-                float score = 0.0f;
-#if defined(PICOLM_F16C) && defined(__FMA__)
-                {
-                    __m256 vsum = _mm256_setzero_ps();
-                    int d = 0;
-                    for (; d + 7 < head_dim; d += 8) {
-                        __m256 vq = _mm256_loadu_ps(qh + d);
-                        __m256 vk = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(kt + d)));
-                        vsum = _mm256_fmadd_ps(vq, vk, vsum);
-                    }
-                    score = hsum_avx(vsum);
-                    for (; d < head_dim; d++) score += qh[d] * fp16_to_fp32(kt[d]);
-                }
-#else
-                for (int d = 0; d < head_dim; d++) {
-                    score += qh[d] * fp16_to_fp32(kt[d]);
-                }
-#endif
-                score *= inv_scale;
-
-                /* Online softmax update (branchless)
-                 * correction=1 when max unchanged, w=exp(score-max) always */
-                const uint16_t *vt = vcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
-                float new_max    = fmaxf(score, max_score);
-                float correction = expf(max_score - new_max);
-                float w          = expf(score    - new_max);
-                sum_exp = sum_exp * correction + w;
-#if defined(PICOLM_F16C) && defined(__FMA__)
-                {
-                    __m256 vcorr = _mm256_set1_ps(correction);
-                    __m256 vw    = _mm256_set1_ps(w);
-                    int d = 0;
-                    for (; d + 7 < head_dim; d += 8) {
-                        __m256 vacc = _mm256_loadu_ps(acc + d);
-                        __m256 vv   = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(vt + d)));
-                        _mm256_storeu_ps(acc + d, _mm256_fmadd_ps(vcorr, vacc, _mm256_mul_ps(vw, vv)));
-                    }
-                    for (; d < head_dim; d++) acc[d] = acc[d] * correction + w * fp16_to_fp32(vt[d]);
-                }
-#else
-                for (int d = 0; d < head_dim; d++) {
-                    acc[d] = acc[d] * correction + w * fp16_to_fp32(vt[d]);
-                }
-#endif
-                max_score = new_max;
+        {
+            int nt = tensor_get_threads();
+            if (nt > n_heads) nt = n_heads;
+            attn_head_task_t tasks[MAX_THREADS];
+            void            *ptrs[MAX_THREADS];
+            int heads_per = n_heads / nt, extra = n_heads % nt, h = 0;
+            for (int i = 0; i < nt; i++) {
+                tasks[i] = (attn_head_task_t){
+                    s->q, kcache_layer, vcache_layer, s->xb,
+                    pos, head_dim, kv_dim, kv_mul,
+                    h, h + heads_per + (i < extra ? 1 : 0)
+                };
+                h = tasks[i].h_end;
+                ptrs[i] = &tasks[i];
             }
-
-            /* Normalize */
-            float inv_sum = 1.0f / sum_exp;
-#ifdef PICOLM_AVX
-            {
-                __m256 vinv = _mm256_set1_ps(inv_sum);
-                int d = 0;
-                for (; d + 7 < head_dim; d += 8)
-                    _mm256_storeu_ps(xbh + d, _mm256_mul_ps(_mm256_loadu_ps(acc + d), vinv));
-                for (; d < head_dim; d++) xbh[d] = acc[d] * inv_sum;
-            }
-#else
-            for (int d = 0; d < head_dim; d++) {
-                xbh[d] = acc[d] * inv_sum;
-            }
-#endif
+            tensor_parallel(run_attn_heads, ptrs, nt);
         }
 
         /* Output projection */

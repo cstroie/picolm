@@ -74,7 +74,8 @@ typedef struct {
     pthread_t       tid;
     pthread_mutex_t mu;
     pthread_cond_t  cv;
-    matmul_task_t   task;
+    void          (*fn)(void *);
+    void           *arg;
     volatile int    state;
 } pool_worker_t;
 
@@ -92,7 +93,7 @@ static void *pool_loop(void *arg) {
 
         if (s == WORKER_SHUTDOWN) break;
 
-        run_task(&w->task);
+        w->fn(w->arg);
 
         pthread_mutex_lock(&w->mu);
         w->state = WORKER_IDLE;
@@ -196,10 +197,13 @@ void matmul(float *out, const float *x, const void *W, int n, int d,
     }
 
     /* Wake background workers 1..nt-1 */
+    matmul_task_t tasks[MAX_THREADS];
     for (int t = 1; t < nt; t++) {
+        tasks[t] = (matmul_task_t){ out, x, wptr, row_bytes, n,
+                                    starts[t], ends[t], qtype };
         pool_worker_t *w = &g_workers[t];
-        w->task = (matmul_task_t){ out, x, wptr, row_bytes, n,
-                                   starts[t], ends[t], qtype };
+        w->fn  = (void (*)(void *))run_task;
+        w->arg = &tasks[t];
         pthread_mutex_lock(&w->mu);
         w->state = WORKER_RUNNING;
         pthread_cond_signal(&w->cv);
@@ -213,6 +217,48 @@ void matmul(float *out, const float *x, const void *W, int n, int d,
     /* Wait for all workers to finish */
     for (int t = 1; t < nt; t++) {
         pool_worker_t *w = &g_workers[t];
+        pthread_mutex_lock(&w->mu);
+        while (w->state == WORKER_RUNNING)
+            pthread_cond_wait(&w->cv, &w->mu);
+        pthread_mutex_unlock(&w->mu);
+    }
+#endif
+}
+
+/* ================================================================
+ * tensor_parallel: dispatch fn(args[i]) across the thread pool.
+ * Each args[i] must remain valid until the call returns.
+ * On single-threaded builds (or nt==1) runs sequentially on main.
+ * ================================================================ */
+void tensor_parallel(void (*fn)(void *), void **args, int nt) {
+#ifdef _WIN32
+    for (int i = 0; i < nt; i++) fn(args[i]);
+#else
+    int pool = (g_pool_size > 0) ? g_pool_size : 1;
+    if (pool <= 1 || nt <= 1) {
+        for (int i = 0; i < nt; i++) fn(args[i]);
+        return;
+    }
+    /* Cap to available workers; run extras on main thread inline */
+    int par = (nt < pool) ? nt : pool;
+
+    /* Wake workers 1..par-1 */
+    for (int i = 1; i < par; i++) {
+        pool_worker_t *w = &g_workers[i];
+        w->fn  = fn;
+        w->arg = args[i];
+        pthread_mutex_lock(&w->mu);
+        w->state = WORKER_RUNNING;
+        pthread_cond_signal(&w->cv);
+        pthread_mutex_unlock(&w->mu);
+    }
+    /* Main thread runs items 0 and any overflow beyond par */
+    fn(args[0]);
+    for (int i = par; i < nt; i++) fn(args[i]);
+
+    /* Wait for background workers */
+    for (int i = 1; i < par; i++) {
+        pool_worker_t *w = &g_workers[i];
         pthread_mutex_lock(&w->mu);
         while (w->state == WORKER_RUNNING)
             pthread_cond_wait(&w->cv, &w->mu);

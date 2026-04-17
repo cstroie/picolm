@@ -41,4 +41,8 @@ void elemwise_mul(float *out, const float *a, const float *b, int size);
 /* Vector add in-place: a[i] += b[i] */
 void vec_add(float *a, const float *b, int size);
 
+/* Dispatch nt jobs across the thread pool: calls fn(args[i]) in parallel.
+ * Falls back to sequential execution when built without threading or nt==1. */
+void tensor_parallel(void (*fn)(void *), void **args, int nt);
+
 #endif /* TENSOR_H */
