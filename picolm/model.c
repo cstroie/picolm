@@ -687,14 +687,16 @@ float *model_forward(model_t *m, int token, int pos) {
             float acc[256]; /* head_dim is typically 64-128 */
             memset(acc, 0, (size_t)head_dim * sizeof(float));
 
+            const float inv_scale = 1.0f / sqrtf((float)head_dim);
+
             for (int t = 0; t <= pos; t++) {
-                /* Compute score: dot(Q_h, K_t) / sqrt(head_dim) */
+                /* Compute score: dot(Q_h, K_t) * inv_sqrt(head_dim) */
                 const uint16_t *kt = kcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
                 float score = 0.0f;
                 for (int d = 0; d < head_dim; d++) {
                     score += qh[d] * fp16_to_fp32(kt[d]);
                 }
-                score /= sqrtf((float)head_dim);
+                score *= inv_scale;
 
                 /* Online softmax update */
                 const uint16_t *vt = vcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
