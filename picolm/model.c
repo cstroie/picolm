@@ -698,23 +698,17 @@ float *model_forward(model_t *m, int token, int pos) {
                 }
                 score *= inv_scale;
 
-                /* Online softmax update */
+                /* Online softmax update (branchless)
+                 * correction=1 when max unchanged, w=exp(score-max) always */
                 const uint16_t *vt = vcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
-
-                if (score > max_score) {
-                    float correction = expf(max_score - score);
-                    sum_exp = sum_exp * correction + 1.0f;
-                    for (int d = 0; d < head_dim; d++) {
-                        acc[d] = acc[d] * correction + fp16_to_fp32(vt[d]);
-                    }
-                    max_score = score;
-                } else {
-                    float w = expf(score - max_score);
-                    sum_exp += w;
-                    for (int d = 0; d < head_dim; d++) {
-                        acc[d] += w * fp16_to_fp32(vt[d]);
-                    }
+                float new_max   = fmaxf(score, max_score);
+                float correction = expf(max_score - new_max);
+                float w          = expf(score    - new_max);
+                sum_exp = sum_exp * correction + w;
+                for (int d = 0; d < head_dim; d++) {
+                    acc[d] = acc[d] * correction + w * fp16_to_fp32(vt[d]);
                 }
+                max_score = new_max;
             }
 
             /* Normalize */
