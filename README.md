@@ -663,7 +663,7 @@ A: Any LLaMA-architecture GGUF model works. Download from [HuggingFace](https://
 - [x] AVX2 kernels for x86 (`make avx2` — 256-bit integer ops for Q4_0 and Q6_K quantized paths)
 - [ ] AVX-512 kernels for x86 (512-bit ops for server CPUs)
 - [ ] Speculative decoding with a draft model
-- [ ] Context sliding window (infinite generation beyond max_seq_len)
+- [x] Context sliding window (infinite generation beyond max_seq_len)
 - [ ] Weight pruning for further memory reduction
 - [ ] Continuous batching for server mode
 - [ ] Mistral / Phi architecture support

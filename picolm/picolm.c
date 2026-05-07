@@ -40,6 +40,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nAdvanced options:\n");
     fprintf(stderr, "  --json         Grammar-constrained JSON output mode\n");
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
+    fprintf(stderr, "  -w <int>       Prefix tokens to pin during KV sliding (default: 0)\n");
 }
 
 static char *read_stdin(void) {
@@ -77,6 +78,7 @@ int main(int argc, char **argv) {
     int    num_threads = 4;
     int    json_mode = 0;
     const char *cache_file = NULL;
+    int    keep_prefix = 0;
 
     /* Parse arguments */
     for (int i = 2; i < argc; i++) {
@@ -98,6 +100,8 @@ int main(int argc, char **argv) {
             json_mode = 1;
         } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
             cache_file = argv[++i];
+        } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+            keep_prefix = atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -151,6 +155,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
+    model.config.keep_prefix = keep_prefix;
 
     tensor_set_threads(num_threads);
 
@@ -203,9 +208,6 @@ int main(int argc, char **argv) {
     int token = prompt_tokens[start_pos > 0 ? start_pos - 1 : 0];
     int pos = start_pos > 0 ? start_pos - 1 : 0;
     int total_steps = n_prompt + max_tokens;
-    if (total_steps > model.config.max_seq_len) {
-        total_steps = model.config.max_seq_len;
-    }
 
     for (; pos < total_steps; pos++) {
         /* Determine which token to feed */

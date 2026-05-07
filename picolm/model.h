@@ -25,6 +25,7 @@ typedef struct {
     float rope_freq_base; /* RoPE theta base (e.g. 10000.0) */
     int alignment;      /* GGUF data alignment */
     gguf_type_t weight_type; /* default weight quantization type */
+    int keep_prefix;    /* positions to pin at front during KV cache sliding (0 = none) */
 } model_config_t;
 
 /* ---- Per-layer weight pointers (into mmap) ---- */
@@ -96,6 +97,9 @@ typedef struct {
     /* Separate allocation for FP16 KV cache */
     void *kv_block;
     size_t kv_size;
+
+    /* Sliding window: number of logical positions evicted from the KV cache front */
+    int kv_shift;
 } run_state_t;
 
 /* ---- Model ---- */
@@ -132,6 +136,10 @@ float *model_forward(model_t *m, int token, int pos);
 
 /* Free all resources. */
 void model_free(model_t *m);
+
+/* Slide the KV cache when the window is full, preserving config.keep_prefix
+ * positions at the front and evicting half the remaining entries. */
+void kvcache_slide(model_t *m);
 
 /* ---- KV cache persistence ---- */
 

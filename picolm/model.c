@@ -566,9 +566,21 @@ float *model_forward(model_t *m, int token, int pos) {
     int seq_len = c->max_seq_len;
     int half_dim = head_dim / 2;
 
-    /* RoPE table pointers for this position */
-    const float *cos_pos = s->rope_cos + (size_t)pos * half_dim;
-    const float *sin_pos = s->rope_sin + (size_t)pos * half_dim;
+    /* Sliding window: evict old entries when the physical slot would overflow */
+    int phys_pos = pos - s->kv_shift;
+    if (phys_pos >= seq_len) {
+        kvcache_slide(m);
+        phys_pos = pos - s->kv_shift;
+    }
+
+    /* Number of KV entries currently filled in the cache */
+    int n_kv_filled = phys_pos + 1;
+
+    /* RoPE table pointers for this logical position (wraps via modulo so the
+     * pre-computed table, sized max_seq_len, is reused after the first window) */
+    int rope_idx = pos % seq_len;
+    const float *cos_pos = s->rope_cos + (size_t)rope_idx * half_dim;
+    const float *sin_pos = s->rope_sin + (size_t)rope_idx * half_dim;
 
     /* 1. Embedding lookup */
     {
@@ -591,10 +603,10 @@ float *model_forward(model_t *m, int token, int pos) {
         float *k_tmp = s->xb2; /* reuse xb2 as temp for K (kv_dim <= dim) */
         matmul(k_tmp, s->xb, lw->attn_k, dim, kv_dim, lw->type_attn_k);
 
-        /* Store K as FP16 */
+        /* Store K as FP16 at the physical slot */
         uint16_t *kcache_layer = s->key_cache + (size_t)l * seq_len * kv_dim;
         uint16_t *vcache_layer = s->val_cache + (size_t)l * seq_len * kv_dim;
-        uint16_t *key_pos_fp16 = kcache_layer + (size_t)pos * kv_dim;
+        uint16_t *key_pos_fp16 = kcache_layer + (size_t)phys_pos * kv_dim;
 
         /* Apply RoPE to Q and K (using pre-computed tables) */
         rope(s->q, k_tmp, head_dim, n_heads, n_kv_heads, cos_pos, sin_pos);
@@ -604,10 +616,10 @@ float *model_forward(model_t *m, int token, int pos) {
             key_pos_fp16[d] = fp32_to_fp16(k_tmp[d]);
         }
 
-        /* V projection -> store directly as FP16 */
+        /* V projection -> store directly as FP16 at the physical slot */
         float *v_tmp = s->xb2;
         matmul(v_tmp, s->xb, lw->attn_v, dim, kv_dim, lw->type_attn_v);
-        uint16_t *val_pos_fp16 = vcache_layer + (size_t)pos * kv_dim;
+        uint16_t *val_pos_fp16 = vcache_layer + (size_t)phys_pos * kv_dim;
         for (int d = 0; d < kv_dim; d++) {
             val_pos_fp16[d] = fp32_to_fp16(v_tmp[d]);
         }
@@ -643,7 +655,7 @@ float *model_forward(model_t *m, int token, int pos) {
             float acc[256]; /* head_dim is typically 64-128 */
             memset(acc, 0, (size_t)head_dim * sizeof(float));
 
-            for (int t = 0; t <= pos; t++) {
+            for (int t = 0; t < n_kv_filled; t++) {
                 /* Compute score: dot(Q_h, K_t) / sqrt(head_dim) */
                 const uint16_t *kt = kcache_layer + (size_t)t * kv_dim + kv_h * head_dim;
                 float score = 0.0f;
@@ -702,6 +714,38 @@ float *model_forward(model_t *m, int token, int pos) {
     matmul(s->logits, s->x, w->output, dim, c->vocab_size, w->type_output);
 
     return s->logits;
+}
+
+/* Evict the oldest non-prefix entries from the KV cache to make room for new
+ * tokens.  The first keep_prefix physical slots are never moved; half of the
+ * remaining filled slots are dropped, and the surviving tail is shifted left.
+ * m->state.kv_shift is incremented by the eviction count so that callers can
+ * always compute physical_slot = logical_pos - kv_shift. */
+void kvcache_slide(model_t *m) {
+    const model_config_t *c = &m->config;
+    int kv_dim  = c->n_kv_heads * c->head_dim;
+    int seq_len = c->max_seq_len;
+    int keep    = c->keep_prefix;
+
+    /* How many sliding-window slots exist after the pinned prefix */
+    int window = seq_len - keep;
+    /* Evict half the window; always evict at least 1 */
+    int evict = window / 2;
+    if (evict < 1) evict = 1;
+    int remaining = window - evict;
+
+    for (int l = 0; l < c->n_layers; l++) {
+        uint16_t *kl = m->state.key_cache + (size_t)l * seq_len * kv_dim;
+        uint16_t *vl = m->state.val_cache + (size_t)l * seq_len * kv_dim;
+        /* Source starts at keep+evict, destination at keep */
+        size_t dst = (size_t)keep * kv_dim;
+        size_t src = (size_t)(keep + evict) * kv_dim;
+        size_t n   = (size_t)remaining * kv_dim * sizeof(uint16_t);
+        memmove(kl + dst, kl + src, n);
+        memmove(vl + dst, vl + src, n);
+    }
+
+    m->state.kv_shift += evict;
 }
 
 void model_free(model_t *m) {
