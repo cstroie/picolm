@@ -108,7 +108,6 @@ typedef struct {
     /* mmap bookkeeping */
     void  *mmap_addr;
     size_t mmap_size;
-    int    use_ram;      /* flag: 1 = load into RAM, 0 = use mmap */
 #ifdef _WIN32
     void  *file_handle;
     void  *map_handle;
@@ -126,7 +125,7 @@ typedef struct {
 } model_t;
 
 /* Load a GGUF model file. Returns 0 on success. */
-int model_load(model_t *m, const char *path, int max_seq_len, int use_ram);
+int model_load(model_t *m, const char *path, int max_seq_len);
 
 /* Run one forward pass. Returns pointer to logits[vocab_size]. */
 float *model_forward(model_t *m, int token, int pos);

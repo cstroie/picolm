@@ -40,7 +40,6 @@ static void usage(const char *prog) {
     fprintf(stderr, "\nAdvanced options:\n");
     fprintf(stderr, "  --json         Grammar-constrained JSON output mode\n");
     fprintf(stderr, "  --cache <file> KV cache file (saves/loads prompt state)\n");
-    fprintf(stderr, "  --mem          Load model into RAM instead of memory-mapping\n");
 }
 
 static char *read_stdin(void) {
@@ -78,7 +77,6 @@ int main(int argc, char **argv) {
     int    num_threads = 4;
     int    json_mode = 0;
     const char *cache_file = NULL;
-    int    use_ram = 0; /* 0 = mmap (default), 1 = load into RAM */
 
     /* Parse arguments */
     for (int i = 2; i < argc; i++) {
@@ -100,8 +98,6 @@ int main(int argc, char **argv) {
             json_mode = 1;
         } else if (strcmp(argv[i], "--cache") == 0 && i + 1 < argc) {
             cache_file = argv[++i];
-        } else if (strcmp(argv[i], "--mem") == 0) {
-            use_ram = 1;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -135,7 +131,6 @@ int main(int argc, char **argv) {
 
     /* Load model */
     fprintf(stderr, "Loading model: %s\n", model_path);
-    fprintf(stderr, "Loading mode: %s\n", use_ram ? "RAM" : "mmap");
     fprintf(stderr, "SIMD: %s\n",
 #if defined(PICOLM_AVX2)
         "AVX2"
@@ -151,9 +146,8 @@ int main(int argc, char **argv) {
         "scalar"
 #endif
     );
-    
     model_t model;
-    if (model_load(&model, model_path, context_override, use_ram) != 0) {
+    if (model_load(&model, model_path, context_override) != 0) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }

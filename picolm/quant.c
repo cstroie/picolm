@@ -484,8 +484,7 @@ float vec_dot_q4_K_f32(const void *src, const float *x, int n) {
             float sum_qx2 = hsum_avx(sum_qx2_v);
             float sum_x2  = hsum_avx(sum_x2_v);
 #elif defined(PICOLM_AVX)
-            /* AVX: nibble extraction stays 128-bit (no AVX2 int), float
-             * accumulators widen to 256-bit (8 floats) halving float ops. */
+            /* AVX: 128-bit nibble extraction (no AVX2 int needed), 256-bit float accumulators */
             __m256 sum_qx1_v = _mm256_setzero_ps();
             __m256 sum_x1_v  = _mm256_setzero_ps();
             __m256 sum_qx2_v = _mm256_setzero_ps();
@@ -522,9 +521,7 @@ float vec_dot_q4_K_f32(const void *src, const float *x, int n) {
             float sum_qx2 = hsum_avx(sum_qx2_v);
             float sum_x2  = hsum_avx(sum_x2_v);
 #elif defined(PICOLM_SSE2)
-            /* SSE2: process 8 quantized bytes per iteration.
-             * Each byte holds two nibbles: lo=q[l]&0xF for first group,
-             * hi=q[l]>>4 for second group (offset by 32 in xp). */
+            /* SSE2: lo nibble → group1 (xp+l), hi nibble → group2 (xp+l+32) */
             __m128 sum_qx1_v = _mm_setzero_ps();
             __m128 sum_x1_v  = _mm_setzero_ps();
             __m128 sum_qx2_v = _mm_setzero_ps();
@@ -600,8 +597,7 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
 
         float sums[16] = {0};
 
-/* Shared macro: sign-extend int8 → float via 128-bit SSE2 ops.
- * Used in both the AVX and SSE2 paths (integer extraction is always 128-bit). */
+/* sign-extend packed int8 → two __m128 floats; used by both AVX and SSE2 paths */
 #define Q6K_CONV(qi8, fa, fb) do { \
     __m128i w16 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, qi8), 8); \
     fa = _mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpacklo_epi16(zero_i, w16), 16)); \
@@ -609,9 +605,7 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
 } while (0)
 
 #ifdef PICOLM_AVX2
-        /* AVX2: 256-bit integer ops — _mm256_cvtepi8_epi32 sign-extends 8
-         * int8 values to 8 int32 in __m256i in one instruction, replacing
-         * the 4-instruction Q6K_CONV chain used in the AVX path. */
+        /* AVX2: _mm256_cvtepi8_epi32 replaces the 4-op Q6K_CONV sign-extension chain */
         const __m128i mask4  = _mm_set1_epi8(0x0F);
         const __m128i mask3  = _mm_set1_epi8(0x03);
         const __m128i sub32  = _mm_set1_epi8(32);
@@ -668,8 +662,7 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
             }
         }
 #elif defined(PICOLM_AVX)
-        /* AVX: same 128-bit integer extraction as SSE2, but float
-         * accumulators are 256-bit — halves the number of float instructions. */
+        /* AVX: 128-bit integer extraction, 256-bit float accumulators */
         const __m128i mask4  = _mm_set1_epi8(0x0F);
         const __m128i mask3  = _mm_set1_epi8(0x03);
         const __m128i sub32  = _mm_set1_epi8(32);
@@ -715,7 +708,6 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
                     Q6K_CONV(q3_i8, qf3a, qf3b);
                     Q6K_CONV(q4_i8, qf4a, qf4b);
 
-                    /* Merge two __m128 → one __m256, load 8 floats at once */
                     acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_set_m128(qf1b, qf1a), _mm256_loadu_ps(xp_c + l)));
                     acc2 = _mm256_add_ps(acc2, _mm256_mul_ps(_mm256_set_m128(qf2b, qf2a), _mm256_loadu_ps(xp_c + l + 32)));
                     acc3 = _mm256_add_ps(acc3, _mm256_mul_ps(_mm256_set_m128(qf3b, qf3a), _mm256_loadu_ps(xp_c + l + 64)));
@@ -728,9 +720,7 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
             }
         }
 #elif defined(PICOLM_SSE2)
-        /* SSE2: process 8 elements per inner iteration.
-         * Each 6-bit value: low 4 bits from ql, high 2 bits from qh.
-         * Values are biased by 32 (range -32..31). */
+        /* SSE2: 6-bit values = lo4(ql) | hi2(qh)<<4, biased by 32 */
         const __m128i mask4  = _mm_set1_epi8(0x0F);
         const __m128i mask3  = _mm_set1_epi8(0x03);
         const __m128i sub32  = _mm_set1_epi8(32);
@@ -742,9 +732,7 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
             const uint8_t *qh_c = qh + chunk * 32;
             const float   *xp_c = xp + chunk * 128;
 
-            /* half=0 -> l=0..15  -> sums[is+0,2,4,6]
-             * half=1 -> l=16..31 -> sums[is+1,3,5,7] */
-            for (int half = 0; half < 2; half++) {
+            for (int half = 0; half < 2; half++) { /* half=0 -> sums[+0,2,4,6], half=1 -> [+1,3,5,7] */
                 int l0   = half * 16;
                 int sidx = is + half;
                 __m128 acc1a = _mm_setzero_ps(), acc1b = _mm_setzero_ps();
@@ -753,24 +741,21 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
                 __m128 acc4a = _mm_setzero_ps(), acc4b = _mm_setzero_ps();
 
                 for (int l = l0; l < l0 + 16; l += 8) {
-                    /* Load 8 bytes each of ql and qh */
                     __m128i qla = _mm_loadl_epi64((const __m128i *)(ql_c + l));
                     __m128i qlb = _mm_loadl_epi64((const __m128i *)(ql_c + l + 32));
                     __m128i qhv = _mm_loadl_epi64((const __m128i *)(qh_c + l));
 
-                    /* Extract nibbles from ql */
                     __m128i lo_a = _mm_and_si128(qla, mask4);
                     __m128i hi_a = _mm_and_si128(_mm_srli_epi16(qla, 4), mask4);
                     __m128i lo_b = _mm_and_si128(qlb, mask4);
                     __m128i hi_b = _mm_and_si128(_mm_srli_epi16(qlb, 4), mask4);
 
-                    /* Extract 2-bit groups from qh (byte-level shifts via epi16 + mask) */
+                    /* epi16 shifts on qh: avoids byte-lane bleed from epi8 shifts */
                     __m128i h01 = _mm_and_si128(qhv, mask3);
                     __m128i h23 = _mm_and_si128(_mm_srli_epi16(qhv, 2), mask3);
                     __m128i h45 = _mm_and_si128(_mm_srli_epi16(qhv, 4), mask3);
                     __m128i h67 = _mm_and_si128(_mm_srli_epi16(qhv, 6), mask3);
 
-                    /* Build 6-bit values as signed int8, range -32..31. */
                     __m128i q1_i8 = _mm_sub_epi8(_mm_or_si128(lo_a, _mm_slli_epi16(h01, 4)), sub32);
                     __m128i q2_i8 = _mm_sub_epi8(_mm_or_si128(lo_b, _mm_slli_epi16(h23, 4)), sub32);
                     __m128i q3_i8 = _mm_sub_epi8(_mm_or_si128(hi_a, _mm_slli_epi16(h45, 4)), sub32);

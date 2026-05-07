@@ -231,14 +231,10 @@ void softmax(float *x, int size) {
 #endif
 }
 
-/* ---- AVX RoPE helper: 4 complex pairs per iteration ---- */
+/* AVX RoPE: 4 complex pairs/iter; addsub handles r*cos-i*sin / r*sin+i*cos in one op */
 #ifdef PICOLM_AVX
 static void rope_avx(float *h, int half, const float *cos_pos, const float *sin_pos) {
     int i = 0;
-    /* Process 4 complex pairs at a time: [r0,i0,r1,i1,r2,i2,r3,i3]
-     * Broadcast cos/sin: [c0,c0,c1,c1,c2,c2,c3,c3] via unpacklo/hi + set_m128.
-     * Swap pairs with permute_ps(0xB1) within each 128-bit lane.
-     * _mm256_addsub_ps: subtract even lanes, add odd lanes. */
     for (; i + 3 < half; i += 4) {
         __m256 v   = _mm256_loadu_ps(h + i * 2);
         __m128 c4  = _mm_loadu_ps(cos_pos + i);
@@ -257,18 +253,10 @@ static void rope_avx(float *h, int half, const float *cos_pos, const float *sin_
 }
 #endif
 
-/* ---- SSE2 RoPE helper: apply rotation to one head ---- */
+/* SSE2/SSE3 RoPE: 2 pairs/iter; SSE3 uses addsub, SSE2 uses sign-mask to negate even lanes */
 #if defined(PICOLM_SSE2) && !defined(PICOLM_AVX)
 static void rope_sse(float *h, int half, const float *cos_pos, const float *sin_pos) {
     int i = 0;
-    /* Process 2 complex pairs at a time: [r0, i0, r1, i1]
-     * r_new = r*cos - i*sin,  i_new = r*sin + i*cos
-     *
-     * With SSE: swap pairs to get [i0, r0, i1, r1], broadcast cos/sin,
-     * then use addsub (SSE3) or sign-mask trick (SSE2).
-     *   a = v  * cv  = [r0*c0, i0*c0, r1*c1, i1*c1]
-     *   b = sv * sv' = [i0*s0, r0*s0, i1*s1, r1*s1]
-     *   result[even] = a - b,  result[odd] = a + b  */
 #ifdef PICOLM_SSE3
     for (; i + 1 < half; i += 2) {
         __m128 v  = _mm_loadu_ps(h + i * 2);
