@@ -38,6 +38,7 @@ $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # --- Static build for single-binary deployment ---
+# Uses SSE2 (not -march=native) so the binary runs on any x86-64, not just the build machine.
 static: CFLAGS += -msse2
 static: LDFLAGS += -static
 static: $(TARGET)

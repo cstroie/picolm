@@ -597,12 +597,14 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
 
         float sums[16] = {0};
 
-/* sign-extend packed int8 → two __m128 floats; used by both AVX and SSE2 paths */
+/* sign-extend packed int8 → two __m128 floats; used by AVX and SSE2 paths */
+#if defined(PICOLM_AVX) || defined(PICOLM_SSE2)
 #define Q6K_CONV(qi8, fa, fb) do { \
     __m128i w16 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, qi8), 8); \
     fa = _mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpacklo_epi16(zero_i, w16), 16)); \
     fb = _mm_cvtepi32_ps(_mm_srai_epi32(_mm_unpackhi_epi16(zero_i, w16), 16)); \
 } while (0)
+#endif
 
 #ifdef PICOLM_AVX2
         /* AVX2: _mm256_cvtepi8_epi32 replaces the 4-op Q6K_CONV sign-extension chain */
