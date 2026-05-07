@@ -360,6 +360,9 @@ float vec_dot_f32_f32(const void *src, const float *x, int n) {
         acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(w + i),     _mm256_loadu_ps(x + i)));
         acc1 = _mm256_add_ps(acc1, _mm256_mul_ps(_mm256_loadu_ps(w + i + 8), _mm256_loadu_ps(x + i + 8)));
     }
+    /* pick up a trailing group of 8 (common: hidden sizes are multiples of 8 not 16) */
+    for (; i + 7 < n; i += 8)
+        acc0 = _mm256_add_ps(acc0, _mm256_mul_ps(_mm256_loadu_ps(w + i), _mm256_loadu_ps(x + i)));
     float sum = hsum_avx(_mm256_add_ps(acc0, acc1));
     for (; i < n; i++) sum += w[i] * x[i];
     return sum;
@@ -597,7 +600,10 @@ float vec_dot_q6_K_f32(const void *src, const float *x, int n) {
 
         float sums[16] = {0};
 
-/* sign-extend packed int8 → two __m128 floats; used by AVX and SSE2 paths */
+/* sign-extend packed int8 → two __m128 floats; used by AVX and SSE2 paths.
+ * Idiom: unpacklo_epi8(zero, x) places each byte in the HIGH byte of a 16-bit
+ * lane; srai_epi16(..., 8) then arithmetic-shifts it down, propagating the sign
+ * bit — equivalent to a sign-extending byte→int16 widening without SSE4.1. */
 #if defined(PICOLM_AVX) || defined(PICOLM_SSE2)
 #define Q6K_CONV(qi8, fa, fb) do { \
     __m128i w16 = _mm_srai_epi16(_mm_unpacklo_epi8(zero_i, qi8), 8); \
