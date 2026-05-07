@@ -272,9 +272,6 @@ Generation options:
   -c <int>       Context length override
   -j <int>       Number of threads (default: 4)
 
-Performance options:
-  --mem          Load model into RAM instead of mmap (consistent latency, more RAM)
-
 Advanced options:
   --json         Grammar-constrained JSON output mode
   --cache <file> KV cache file (saves/loads prompt state)

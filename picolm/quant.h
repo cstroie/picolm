@@ -37,7 +37,6 @@ static inline float hsum_sse(__m128 v) {
 
 #if defined(PICOLM_SSE2) && defined(__AVX__)
 #define PICOLM_AVX 1
-/* immintrin.h already included above; AVX intrinsics are available */
 static inline float hsum_avx(__m256 v) {
     __m128 lo = _mm256_castps256_ps128(v);
     __m128 hi = _mm256_extractf128_ps(v, 1);
