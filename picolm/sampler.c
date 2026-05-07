@@ -103,3 +103,41 @@ int sampler_sample(sampler_t *s, float *logits, int vocab_size) {
     free(sorted);
     return result;
 }
+
+float sampler_rand(sampler_t *s) {
+    return rand_float(&s->rng_state);
+}
+
+int sampler_sample_probs(sampler_t *s, float *probs, int vocab_size) {
+    if (s->temperature <= 0.0f) {
+        int best = 0;
+        for (int i = 1; i < vocab_size; i++)
+            if (probs[i] > probs[best]) best = i;
+        return best;
+    }
+    if (s->top_p >= 1.0f) {
+        float r = rand_float(&s->rng_state);
+        float cum = 0.0f;
+        for (int i = 0; i < vocab_size; i++) {
+            cum += probs[i];
+            if (cum > r) return i;
+        }
+        return vocab_size - 1;
+    }
+    prob_index_t *sorted = (prob_index_t *)malloc((size_t)vocab_size * sizeof(prob_index_t));
+    for (int i = 0; i < vocab_size; i++) { sorted[i].prob = probs[i]; sorted[i].index = i; }
+    qsort(sorted, (size_t)vocab_size, sizeof(prob_index_t), cmp_prob_desc);
+    float cum = 0.0f; int cutoff = 0;
+    for (int i = 0; i < vocab_size; i++) {
+        cum += sorted[i].prob; cutoff = i + 1;
+        if (cum >= s->top_p) break;
+    }
+    float r = rand_float(&s->rng_state) * cum;
+    float acc = 0.0f; int result = sorted[0].index;
+    for (int i = 0; i < cutoff; i++) {
+        acc += sorted[i].prob;
+        if (acc > r) { result = sorted[i].index; break; }
+    }
+    free(sorted);
+    return result;
+}
